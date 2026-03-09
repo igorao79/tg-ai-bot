@@ -2,10 +2,11 @@ from http.server import BaseHTTPRequestHandler
 import os
 import json
 import urllib.request
+import urllib.error
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama-3.1-70b-versatile"
 
 
 def send_message(chat_id, text):
@@ -45,7 +46,11 @@ def ask_groq(user_message):
             "Authorization": f"Bearer {GROQ_API_KEY}",
         },
     )
-    resp = urllib.request.urlopen(req)
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise Exception(f"Groq API {e.code}: {error_body}")
     body = json.loads(resp.read().decode("utf-8"))
     return body["choices"][0]["message"]["content"]
 
@@ -80,6 +85,12 @@ class handler(BaseHTTPRequestHandler):
 
         if text == "/start":
             send_message(chat_id, "Привет! Напиши мне любой вопрос, и я отвечу с помощью ИИ.\n\nНапример: сколько будет 5+5?")
+            return
+
+        if text == "/debug":
+            key_len = len(GROQ_API_KEY)
+            key_preview = GROQ_API_KEY[:4] + "..." if key_len > 4 else "(пусто)"
+            send_message(chat_id, f"GROQ_API_KEY: {key_preview} (длина: {key_len})\nМодель: {GROQ_MODEL}")
             return
 
         if not text or text.startswith("/"):
