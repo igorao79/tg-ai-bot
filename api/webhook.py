@@ -3,8 +3,8 @@ import os
 import json
 import urllib.request
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
