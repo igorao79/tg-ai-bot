@@ -44,6 +44,7 @@ def ask_groq(user_message):
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {GROQ_API_KEY}",
+            "User-Agent": "TelegramBot/1.0",
         },
     )
     try:
