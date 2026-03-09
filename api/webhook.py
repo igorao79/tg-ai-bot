@@ -1,17 +1,19 @@
+from http.server import BaseHTTPRequestHandler
 import os
 import json
 import urllib.request
-import urllib.parse
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.3-70b-versatile"
+
 
 def send_message(chat_id, text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req)
+
 
 def send_chat_action(chat_id, action="typing"):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction"
@@ -21,6 +23,7 @@ def send_chat_action(chat_id, action="typing"):
         urllib.request.urlopen(req)
     except Exception:
         pass
+
 
 def ask_groq(user_message):
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -46,35 +49,46 @@ def ask_groq(user_message):
     body = json.loads(resp.read().decode("utf-8"))
     return body["choices"][0]["message"]["content"]
 
-def handler(request):
-    if request.method == "GET":
-        return "Bot is running!"
 
-    try:
-        body = json.loads(request.body.decode("utf-8"))
-    except Exception:
-        return "ok"
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write("Bot is running!".encode("utf-8"))
 
-    message = body.get("message")
-    if not message:
-        return "ok"
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(content_length)
 
-    chat_id = message["chat"]["id"]
-    text = message.get("text", "")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write("ok".encode("utf-8"))
 
-    if text == "/start":
-        send_message(chat_id, "Привет! Напиши мне любой вопрос, и я отвечу с помощью ИИ.\n\nНапример: сколько будет 5+5?")
-        return "ok"
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            return
 
-    if not text or text.startswith("/"):
-        return "ok"
+        message = body.get("message")
+        if not message:
+            return
 
-    send_chat_action(chat_id)
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "")
 
-    try:
-        answer = ask_groq(text)
-        send_message(chat_id, answer)
-    except Exception as e:
-        send_message(chat_id, f"Ошибка: {e}")
+        if text == "/start":
+            send_message(chat_id, "Привет! Напиши мне любой вопрос, и я отвечу с помощью ИИ.\n\nНапример: сколько будет 5+5?")
+            return
 
-    return "ok"
+        if not text or text.startswith("/"):
+            return
+
+        send_chat_action(chat_id)
+
+        try:
+            answer = ask_groq(text)
+            send_message(chat_id, answer)
+        except Exception as e:
+            send_message(chat_id, f"Ошибка: {e}")
