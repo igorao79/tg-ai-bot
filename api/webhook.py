@@ -4,7 +4,6 @@ import json
 import base64
 import time
 import hashlib
-import hmac
 import urllib.request
 import urllib.error
 import re
@@ -12,6 +11,8 @@ import re
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
+UPSTASH_REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
@@ -24,6 +25,8 @@ MAX_VOICE_SIZE_MB = 25
 RATE_LIMIT_SECONDS = 3
 TELEGRAM_MSG_LIMIT = 4096
 REQUEST_TIMEOUT = 30
+CONTEXT_TTL = 1800  # 30 minutes
+MAX_CONTEXT_MESSAGES = 20  # last 10 pairs (user + assistant)
 
 SYSTEM_PROMPT = (
     "Ты полезный ассистент. Отвечай кратко и по делу на русском языке. "
@@ -37,6 +40,55 @@ SYSTEM_PROMPT = (
 _last_request = {}
 
 
+# --- Upstash Redis helpers ---
+def redis_command(*args):
+    if not UPSTASH_REDIS_URL or not UPSTASH_REDIS_TOKEN:
+        return None
+    url = f"{UPSTASH_REDIS_URL}"
+    payload = list(args)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {UPSTASH_REDIS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=5)
+        body = json.loads(resp.read().decode("utf-8"))
+        return body.get("result")
+    except Exception:
+        return None
+
+
+def get_chat_history(chat_id):
+    key = f"chat:{chat_id}"
+    raw = redis_command("GET", key)
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def save_chat_history(chat_id, history):
+    key = f"chat:{chat_id}"
+    # Keep only last N messages
+    if len(history) > MAX_CONTEXT_MESSAGES:
+        history = history[-MAX_CONTEXT_MESSAGES:]
+    data = json.dumps(history, ensure_ascii=False)
+    redis_command("SET", key, data, "EX", str(CONTEXT_TTL))
+
+
+def clear_chat_history(chat_id):
+    key = f"chat:{chat_id}"
+    redis_command("DEL", key)
+
+
+# --- Rate limiter ---
 def is_rate_limited(chat_id):
     now = time.time()
     last = _last_request.get(chat_id, 0)
@@ -44,11 +96,11 @@ def is_rate_limited(chat_id):
         return True
     _last_request[chat_id] = now
     if len(_last_request) > 500:
-        cutoff = now - 120
         _last_request.clear()
     return False
 
 
+# --- Telegram helpers ---
 def send_message(chat_id, text, parse_mode=None):
     chunks = []
     while len(text) > TELEGRAM_MSG_LIMIT:
@@ -71,7 +123,6 @@ def send_message(chat_id, text, parse_mode=None):
         try:
             urllib.request.urlopen(req, timeout=10)
         except Exception:
-            # Retry without parse_mode if Markdown fails
             if parse_mode:
                 payload.pop("parse_mode", None)
                 data = json.dumps(payload).encode("utf-8")
@@ -111,14 +162,20 @@ def download_file(file_url, max_size_mb):
     return file_bytes
 
 
-def ask_groq(user_message):
+# --- Groq API ---
+def ask_groq(user_message, chat_id=None):
     url = "https://api.groq.com/openai/v1/chat/completions"
+
+    # Build messages with context
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if chat_id:
+        history = get_chat_history(chat_id)
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
     payload = {
         "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
+        "messages": messages,
         "temperature": 0.7,
         "max_tokens": 1024,
     }
@@ -141,10 +198,19 @@ def ask_groq(user_message):
     except Exception:
         raise Exception("AI сервис не отвечает, попробуй позже.")
     body = json.loads(resp.read().decode("utf-8"))
-    return body["choices"][0]["message"]["content"]
+    answer = body["choices"][0]["message"]["content"]
+
+    # Save to context
+    if chat_id:
+        history = get_chat_history(chat_id)
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": answer})
+        save_chat_history(chat_id, history)
+
+    return answer
 
 
-def ask_groq_vision(image_base64, caption=""):
+def ask_groq_vision(image_base64, caption="", chat_id=None):
     url = "https://api.groq.com/openai/v1/chat/completions"
     user_text = caption if caption else "Опиши что на этом изображении."
     payload = {
@@ -186,7 +252,16 @@ def ask_groq_vision(image_base64, caption=""):
     except Exception:
         raise Exception("AI сервис не отвечает, попробуй позже.")
     body = json.loads(resp.read().decode("utf-8"))
-    return body["choices"][0]["message"]["content"]
+    answer = body["choices"][0]["message"]["content"]
+
+    # Save text part to context
+    if chat_id:
+        history = get_chat_history(chat_id)
+        history.append({"role": "user", "content": f"[Фото] {user_text}"})
+        history.append({"role": "assistant", "content": answer})
+        save_chat_history(chat_id, history)
+
+    return answer
 
 
 def transcribe_voice(audio_bytes, file_ext="ogg"):
@@ -224,6 +299,7 @@ def transcribe_voice(audio_bytes, file_ext="ogg"):
     return result.get("text", "")
 
 
+# --- Group chat helpers ---
 def is_group_chat(message):
     chat_type = message.get("chat", {}).get("type", "private")
     return chat_type in ("group", "supergroup")
@@ -239,6 +315,7 @@ def strip_bot_mention(text):
     return re.sub(rf"@{BOT_USERNAME}\b", "", text, flags=re.IGNORECASE).strip()
 
 
+# --- Main message handler ---
 def process_message(message):
     chat_id = message["chat"]["id"]
     text = message.get("text", "")
@@ -247,9 +324,12 @@ def process_message(message):
     if text == "/start" or text == f"/start@{BOT_USERNAME}":
         send_message(chat_id,
             "Привет! Я AI-ассистент. Вот что я умею:\n\n"
-            "- Отвечать на вопросы\n"
+            "- Отвечать на вопросы (помню контекст 30 мин)\n"
             "- Анализировать фото (отправь картинку)\n"
             "- Понимать голосовые сообщения\n\n"
+            "Команды:\n"
+            "/help — что я умею\n"
+            "/clear — очистить историю диалога\n\n"
             "Просто напиши мне!")
         return
 
@@ -261,7 +341,15 @@ def process_message(message):
             "- Отправь фото — опишу что на нём\n"
             "- Отправь фото с подписью — отвечу на вопрос по картинке\n"
             "- Отправь голосовое — распознаю речь и отвечу\n\n"
+            "Я помню контекст разговора 30 минут.\n"
+            "/clear — сбросить историю\n\n"
             "В группе обращайся через @igorao79_bot")
+        return
+
+    # /clear command
+    if text == "/clear" or text == f"/clear@{BOT_USERNAME}":
+        clear_chat_history(chat_id)
+        send_message(chat_id, "История диалога очищена.")
         return
 
     # Ignore other commands
@@ -294,8 +382,8 @@ def process_message(message):
             if not transcription.strip():
                 send_message(chat_id, "Не удалось распознать речь. Попробуй ещё раз.")
                 return
-            answer = ask_groq(transcription)
-            send_message(chat_id, f"🎤 *{transcription}*\n\n{answer}", parse_mode="Markdown")
+            answer = ask_groq(transcription, chat_id=chat_id)
+            send_message(chat_id, f"\U0001f3a4 _{transcription}_\n\n{answer}", parse_mode="Markdown")
         except Exception as e:
             send_message(chat_id, f"Ошибка: {e}")
         return
@@ -313,7 +401,7 @@ def process_message(message):
             if len(caption) > MAX_TEXT_LENGTH:
                 send_message(chat_id, f"Подпись слишком длинная (макс {MAX_TEXT_LENGTH} символов).")
                 return
-            answer = ask_groq_vision(image_b64, caption)
+            answer = ask_groq_vision(image_b64, caption, chat_id=chat_id)
             send_message(chat_id, answer, parse_mode="Markdown")
         except Exception as e:
             send_message(chat_id, f"Ошибка: {e}")
@@ -329,7 +417,7 @@ def process_message(message):
     send_chat_action(chat_id)
 
     try:
-        answer = ask_groq(text)
+        answer = ask_groq(text, chat_id=chat_id)
         send_message(chat_id, answer, parse_mode="Markdown")
     except Exception as e:
         send_message(chat_id, f"Ошибка: {e}")
