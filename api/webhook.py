@@ -25,8 +25,9 @@ MAX_VOICE_SIZE_MB = 25
 RATE_LIMIT_SECONDS = 3
 TELEGRAM_MSG_LIMIT = 4096
 REQUEST_TIMEOUT = 30
-CONTEXT_TTL = 1800  # 30 minutes
+CONTEXT_TTL = 3600  # 1 hour
 MAX_CONTEXT_MESSAGES = 20  # last 10 pairs (user + assistant)
+COMPACT_KEEP_RECENT = 6  # keep 3 recent pairs after compaction
 
 SYSTEM_PROMPT = (
     "Ты полезный ассистент. Отвечай кратко и по делу на русском языке. "
@@ -74,11 +75,74 @@ def get_chat_history(chat_id):
         return []
 
 
+def compact_history(history):
+    """Compress old messages into a summary, keep recent ones."""
+    if len(history) <= MAX_CONTEXT_MESSAGES:
+        return history
+
+    old_messages = history[:-COMPACT_KEEP_RECENT]
+    recent_messages = history[-COMPACT_KEEP_RECENT:]
+
+    # Check if already has a summary at the start
+    summary_text = ""
+    if old_messages and old_messages[0].get("role") == "system":
+        summary_text = old_messages[0]["content"] + "\n\n"
+        old_messages = old_messages[1:]
+
+    # Build conversation text for summarization
+    convo_lines = []
+    for msg in old_messages:
+        role = "Пользователь" if msg["role"] == "user" else "Ассистент"
+        convo_lines.append(f"{role}: {msg['content']}")
+
+    if not convo_lines:
+        return recent_messages
+
+    convo_text = "\n".join(convo_lines)
+
+    prompt = (
+        "Сожми следующий диалог в 2-3 коротких предложения на русском. "
+        "Сохрани ключевые факты, имена, числа и контекст. "
+        "Отвечай ТОЛЬКО резюме, без пояснений.\n\n"
+    )
+    if summary_text:
+        prompt += f"Предыдущее резюме: {summary_text}\n"
+    prompt += f"Диалог:\n{convo_text}"
+
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 256,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "User-Agent": "TelegramBot/1.0",
+            },
+        )
+        resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
+        body = json.loads(resp.read().decode("utf-8"))
+        summary = body["choices"][0]["message"]["content"]
+
+        # Return summary as system context + recent messages
+        return [{"role": "system", "content": f"Резюме предыдущего разговора: {summary}"}] + recent_messages
+    except Exception:
+        # If summarization fails, just keep recent messages
+        return recent_messages
+
+
 def save_chat_history(chat_id, history):
     key = f"chat:{chat_id}"
-    # Keep only last N messages
+    # Compact if over limit
     if len(history) > MAX_CONTEXT_MESSAGES:
-        history = history[-MAX_CONTEXT_MESSAGES:]
+        history = compact_history(history)
     data = json.dumps(history, ensure_ascii=False)
     redis_command("SET", key, data, "EX", str(CONTEXT_TTL))
 
@@ -324,7 +388,7 @@ def process_message(message):
     if text == "/start" or text == f"/start@{BOT_USERNAME}":
         send_message(chat_id,
             "Привет! Я AI-ассистент. Вот что я умею:\n\n"
-            "- Отвечать на вопросы (помню контекст 30 мин)\n"
+            "- Отвечать на вопросы (помню контекст 1 час)\n"
             "- Анализировать фото (отправь картинку)\n"
             "- Понимать голосовые сообщения\n\n"
             "Команды:\n"
@@ -341,7 +405,7 @@ def process_message(message):
             "- Отправь фото — опишу что на нём\n"
             "- Отправь фото с подписью — отвечу на вопрос по картинке\n"
             "- Отправь голосовое — распознаю речь и отвечу\n\n"
-            "Я помню контекст разговора 30 минут.\n"
+            "Я помню контекст разговора 1 час.\n"
             "/clear — сбросить историю\n\n"
             "В группе обращайся через @igorao79_bot")
         return
